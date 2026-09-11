@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grid with Countdown</title>
+<style>
+  :root { --phosphor: #ffb43c; }
+  body { background: #000; margin: 0; overflow: hidden; font-family: ui-monospace, monospace; }
+  #grid { 
+    display: grid; gap: 1px; background: #1b1b1b;
+    grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(4, 1fr);
+    height: 100vh; width: 100vw;
+  }
+  @media (orientation: portrait) {
+    #grid { grid-template-columns: repeat(4, 1fr); grid-template-rows: repeat(8, 1fr); }
+  }
+  .cell { position: relative; background: #050505; overflow: hidden; }
+  .cell iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #000; }
+</style>
+</head>
+<body>
+
+<div id="grid"></div>
+
+<script>
+const CELLS = 128;
+const grid = document.getElementById('grid');
+
+// --- THE WEBGPU KERNEL CONTENT ---
+const GPU_KERNEL_HTML = `
+<!doctype html>
+<html>
+<body style="margin:0; background:#111; color:#569cd6; font-family:monospace; font-size:10px; overflow:hidden;">
+<div id="status">Initializing WebGPU...</div>
+<script type="module">
+const NPROP = 4; const NTHREAD = 65536;
+const SHADER = \`struct Node { thr : i32, prop : i32, leaf : i32, pad1 : i32, l : i32, r : i32, pad2 : i32, pad3 : i32 };
+struct Params { nth : u32 };
+@group(0) @binding(0) var<storage, read> n : array<Node>;
+@group(0) @binding(1) var<storage, read> props : array<i32>;
+@group(0) @binding(2) var<storage, read_write> out : array<i32>;
+@group(0) @binding(3) var<uniform> params : Params;
+@compute @workgroup_size(256)
+fn walk(@builtin(global_invocation_id) gid_v : vec3<u32>) {
+  let gid_i = gid_v.x; if (gid_i >= params.nth) { return; }
+  var k : i32 = 0; while (n[k].leaf == 0) {
+    let pk = props[gid_i * \${NPROP}u + u32(n[k].prop)];
+    if (pk <= n[k].thr) { k = n[k].l; } else { k = n[k].r; }
+  }
+  out[gid_i] = n[k].leaf - 1;
+}\`;
+const NODE_I32S = 8;
+function buildCyclicTree() {
+  const n = new Int32Array(15 * NODE_I32S);
+  for (let i = 0; i < 7; i++) { n[i*NODE_I32S+0]=0; n[i*NODE_I32S+1]=i%NPROP; n[i*NODE_I32S+2]=0; n[i*NODE_I32S+3]=0; n[i*NODE_I32S+4]=2*i+1; n[i*NODE_I32S+5]=2*i+2; }
+  for (let i = 7; i < 15; i++) { n[i*NODE_I32S+0]=0; n[i*NODE_I32S+1]=0; n[i*NODE_I32S+2]=i-6; n[i*NODE_I32S+3]=0; n[i*NODE_I32S+4]=-1; n[i*NODE_I32S+5]=-1; }
+  n[1*NODE_I32S+2]=0; n[1*NODE_I32S+4]=0; return n;
+}
+async function init() {
+  if (!navigator.gpu) { document.getElementById('status').textContent = "No WebGPU"; return; }
+  const adapter = await navigator.gpu.requestAdapter();
+  const device = await adapter.requestDevice();
+  const queue = device.queue;
+  const statusEl = document.getElementById('status');
+  const nodeBuf = device.createBuffer({ size: 15 * NODE_I32S * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const propBuf = device.createBuffer({ size: NTHREAD * NPROP * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const outBuf = device.createBuffer({ size: NTHREAD * 4, usage: GPUBufferUsage.STORAGE });
+  const paramBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  queue.writeBuffer(nodeBuf, 0, buildCyclicTree());
+  queue.writeBuffer(propBuf, 0, new Int32Array(NTHREAD * NPROP).fill(-1));
+  queue.writeBuffer(paramBuf, 0, new Uint32Array([NTHREAD, 0]));
+  const module = device.createShaderModule({ code: SHADER });
+  const bgl = device.createBindGroupLayout({ entries: [{ binding:0, visibility:GPUShaderStage.COMPUTE, buffer:{ type:'read-only-storage' } }, { binding:1, visibility:GPUShaderStage.COMPUTE, buffer:{ type:'read-only-storage' } }, { binding:2, visibility:GPUShaderStage.COMPUTE, buffer:{ type:'storage' } }, { binding:3, visibility:GPUShaderStage.COMPUTE, buffer:{ type:'uniform' } }] });
+  const layout = device.createPipelineLayout({ bindGroupLayouts:[bgl] });
+  const walkPs = device.createComputePipeline({ layout, compute: { module, entryPoint: 'walk' } });
+  const bg = device.createBindGroup({ layout: bgl, entries: [{ binding:0, resource:{ buffer:nodeBuf } }, { binding:1, resource:{ buffer:propBuf } }, { binding:2, resource:{ buffer:outBuf } }, { binding:3, resource:{ buffer:paramBuf } }] });
+  const wgFull = Math.ceil(NTHREAD / 256); let count = 0;
+  setInterval(() => {
+    count++;
+    const enc = device.createCommandEncoder();
+    const p = enc.beginComputePass();
+    p.setPipeline(walkPs);
+    p.setBindGroup(0, bg);
+    p.dispatchWorkgroups(wgFull);
+    p.end();
+    queue.submit([enc.finish()]);
+    statusEl.textContent = "Kernels: " + count;
+  }, 0);
+}
+init();
+<\/script>
+</body>
+</html>`;
+
+// --- THE COUNTDOWN CONTENT ---
+const COUNTDOWN_HTML = `
+<!doctype html>
+<html>
+<body style="margin:0; background:#000; color:#ffb43c; display:flex; align-items:center; justify-content:center; height:100vh; font-family:monospace; font-size:3rem;">
+<div id="timer">120</div>
+<script>
+  let timeLeft = 120;
+  const el = document.getElementById('timer');
+  setInterval(() => {
+    if (timeLeft > 0) {
+      timeLeft--;
+      el.textContent = timeLeft;
+    }
+  }, 1000);
+<\/script>
+</body>
+</html>`;
+
+// --- GRID GENERATION ---
+for (let i = 0; i < CELLS; i++) {
+  const cell = document.createElement('div');
+  cell.className = 'cell';
+
+  const iframe = document.createElement('iframe');
+  // Use the countdown for index 0, otherwise use the WebGPU kernel template
+  const content = (i === 0) ? COUNTDOWN_HTML : GPU_KERNEL_HTML;
+  const blob = new Blob([content], { type: 'text/html' });
+  iframe.src = URL.createObjectURL(blob);
+
+  cell.appendChild(iframe);
+  grid.appendChild(cell);
+}
+</script>
+
+</body>
+</html>
+
